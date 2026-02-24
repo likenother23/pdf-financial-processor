@@ -275,33 +275,64 @@ def extract_company(text: str) -> str:
             return candidate
 
     noise = {"fatura", "invoice", "tarih", "date", "sayin", "sayın",
-             "vergi", "kdv", "toplam", "tutar", "adres"}
+             "vergi", "kdv", "toplam", "tutar", "adres", "mal", "hizmet",
+             "miktar", "birim", "sira", "sıra", "aciklama", "açıklama"}
     for line in [l.strip() for l in text.splitlines() if l.strip()][:10]:
-        first_word = line.split()[0].lower() if line.split() else ""
-        if len(line.split()) >= 2 and first_word not in noise:
+        words = line.split()
+        first_word = words[0].lower() if words else ""
+        if len(words) >= 2 and first_word not in noise:
             return line[:80].strip()
     return ""
 
 
+def _looks_like_company(name: str) -> bool:
+    """Return False if the extracted name is clearly a table cell or amount, not a company."""
+    if not name:
+        return False
+    _non_company = {
+        "mal", "hizmet", "toplam", "tutar", "kdv", "vergi", "tarih", "fatura",
+        "miktar", "birim", "aciklama", "açıklama", "teslim", "plaka", "tevkifat",
+        "hesaplanan", "vergiler", "odenecek", "ödenecek", "yalniz", "yalnız",
+    }
+    first_words = [w.lower().strip(".,;:[]()|") for w in name.split()[:3]]
+    return not any(w in _non_company for w in first_words)
+
+
 # ── fatura no extraction ───────────────────────────────────────────────────────
+
+def _normalize_fatura(val: str) -> str:
+    """
+    Fix common OCR errors in e-fatura codes.
+    Turkish e-fatura format: 2-5 letter prefix + year (4 digits) + sequence (9 digits)
+    Once the first digit is encountered, any 'O' is almost certainly a misread '0'.
+    """
+    val = val.upper()
+    result = []
+    found_digit = False
+    for ch in val:
+        if ch.isdigit():
+            found_digit = True
+        # After first digit, OCR 'O' = zero
+        result.append('0' if (found_digit and ch == 'O') else ch)
+    return "".join(result)
+
 
 def extract_fatura_no(text: str) -> str:
     """
     Extract invoice number from Turkish e-fatura documents.
-    The captured value must contain at least 2 digits to avoid
-    matching plain words like 'FATURA' from OCR table layouts.
+    Handles OCR artifacts: leading [ brackets, lowercase o instead of 0.
+    The result must contain at least 2 digits to filter out plain words.
     """
     patterns = [
-        r"fatura\s+no[:\s]+([A-Z0-9]{5,30})",      # no | in separator
-        r"invoice\s+no[:\s]+([A-Z0-9]{5,30})",
-        r"fatura\s+numaras[iı][:\s]+([A-Z0-9]{5,30})",
-        r"\b([A-Z]{2,4}20\d{2}\d{9})\b",            # EFA2026000000001 style
+        r"fatura\s+no[:\s]+[\[\(]?([A-Za-z0-9]{5,30})",
+        r"invoice\s+no[:\s]+[\[\(]?([A-Za-z0-9]{5,30})",
+        r"fatura\s+numaras[iı][:\s]+[\[\(]?([A-Za-z0-9]{5,30})",
+        r"\b([A-Za-z]{2,5}[2Z]0\d{2}[0-9oO]{9})\b",   # EFA2026... style
     ]
     for pat in patterns:
         m = re.search(pat, text, re.IGNORECASE)
         if m:
-            val = m.group(1).strip().upper()
-            # Must contain at least 2 digits – filters out plain words
+            val = _normalize_fatura(m.group(1).strip())
             if sum(c.isdigit() for c in val) >= 2:
                 return val
     return ""
@@ -409,8 +440,9 @@ def is_continuation(current: dict, prev: dict) -> bool:
     Rules (in order):
     1. Same non-empty fatura_no → definitely same document.
     2. Same non-empty IBAN and both bank_statement → same bank statement.
-    3. Current page has no fatura_no, no date, no company, and same doc_type
-       as previous → likely a continuation page (e.g. item detail page 2).
+    3. Current page has no fatura_no AND no company AND no date → it is a
+       content/detail continuation page (e.g. invoice item list page 2).
+       Grouped with previous regardless of doc_type mismatch.
     4. Everything else → new document.
     """
     # Rule 1: matching invoice numbers
@@ -423,11 +455,11 @@ def is_continuation(current: dict, prev: dict) -> bool:
             and current["iban"] and current["iban"] == prev["iban"]):
         return True
 
-    # Rule 3: blank continuation page
+    # Rule 3: no real identifying info → continuation of whatever came before
+    # Also catches pages where company extraction grabbed a table cell value
     if (not current["fatura_no"]
             and not current["date_obj"]
-            and not current["company"]
-            and current["doc_type"] == prev["doc_type"]):
+            and not _looks_like_company(current["company"])):
         return True
 
     return False
