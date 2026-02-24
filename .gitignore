@@ -1,0 +1,14 @@
+# Output — never commit processed PDFs or logs
+results/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# EasyOCR model cache
+.EasyOCR/
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini

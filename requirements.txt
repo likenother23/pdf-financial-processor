@@ -1,0 +1,7 @@
+pymupdf
+pdfplumber
+pypdf
+easyocr
+Pillow
+pandas
+numpy

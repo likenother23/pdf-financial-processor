@@ -457,7 +457,9 @@ def process_pdf(pdf_path: str) -> None:
         print(f"[ERROR] File not found: {pdf_path}")
         sys.exit(1)
 
-    base_out = Path(pdf_path).parent / "output"
+    # Results always land in results/ inside the repo (next to this script)
+    REPO_DIR = Path(__file__).resolve().parent
+    base_out = REPO_DIR / "results"
     base_out.mkdir(parents=True, exist_ok=True)
 
     log_rows = []
@@ -512,20 +514,20 @@ def process_pdf(pdf_path: str) -> None:
             # ── 5. Save page ──────────────────────────────────────────────────
             save_page_as_pdf(pdf_path, page_idx, out_path)
 
-            rel_path = out_path.relative_to(base_out.parent)
-            row["output_filename"] = str(rel_path)
+            rel_path = out_path.relative_to(base_out)
+            row["output_filename"] = str(out_path.relative_to(base_out.parent))
             row["status"]          = "success"
 
             # ── Console output ────────────────────────────────────────────────
-            date_display    = row["extracted_date"]    or "no date"
-            company_display = company_raw[:30]          or "no company"
+            date_display    = row["extracted_date"] or "no date"
+            company_display = company_raw[:30]       or "no company"
             print(
                 f"[Page {page_num:>4}/{total_pages}] "
                 f"classified as: {doc_type:<16} | "
                 f"method: {method:<11} | "
                 f"date: {date_display:<12} | "
                 f"company: {company_display:<30} | "
-                f"saved: output/{rel_path.relative_to(Path(pdf_path).parent / 'output')}"
+                f"saved: results/{rel_path}"
             )
 
             if doc_type == "unknown":
