@@ -1,6 +1,9 @@
 # Output — never commit processed PDFs or logs
 results/
 
+# Source PDFs — too large to track in git
+*.pdf
+
 # Python cache
 __pycache__/
 *.py[cod]
