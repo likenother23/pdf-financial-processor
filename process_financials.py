@@ -75,14 +75,24 @@ INCOME_KEYWORDS = [
     "alındı", "alindi",
 ]
 
-BANK_KEYWORDS = [
-    "hesap özeti", "hesap ozeti", "ekstre", "bank statement", "banka",
-    "iban", "bakiye", "hesap hareketi", "hesap hareketleri",
-    "swift", "bic", "debit", "credit", "balance", "account statement",
+# Strong = exclusive to real bank statements
+BANK_STRONG_KEYWORDS = [
+    "hesap özeti", "hesap ozeti", "ekstre",
+    "hesap hareketi", "hesap hareketleri",
+    "bank statement", "account statement",
+]
+
+# Weak = can appear on invoices too — need 3+ to trigger bank_statement
+# Note: "iban" intentionally excluded — it appears on all invoices for payment
+BANK_WEAK_KEYWORDS = [
+    "bakiye", "banka", "swift", "bic", "debit", "credit", "balance",
+    "ödeme emri", "odeme emri", "havale", "eft",
     "garanti", "akbank", "ziraat", "isbank", "yapı kredi", "yapi kredi",
     "halkbank", "vakıfbank", "vakifbank", "denizbank", "fibabanka", "qnb",
-    "ödeme emri", "odeme emri", "havale", "eft",
 ]
+
+# Keep a combined list so existing code that references BANK_KEYWORDS still works
+BANK_KEYWORDS = BANK_STRONG_KEYWORDS + BANK_WEAK_KEYWORDS
 
 
 # ── text extraction ────────────────────────────────────────────────────────────
@@ -121,14 +131,27 @@ def get_page_text(pdf_path: str, page_index: int) -> tuple[str, str]:
 
 # ── classification ─────────────────────────────────────────────────────────────
 
-def classify_page(text: str) -> str:
+def classify_page(text: str, fatura_no: str = "") -> str:
     t = text.lower()
-    bank_score   = sum(1 for kw in BANK_KEYWORDS   if kw in t)
+
+    # ── Rule 0: fatura no present → it's an invoice, never a bank statement ──
+    # Invoices list IBAN/banka for payment, which would otherwise trigger
+    # the bank keyword check. Detecting a fatura number short-circuits that.
+    if not fatura_no:
+        fatura_no = extract_fatura_no(text)
+
+    is_invoice = bool(fatura_no)
+
+    # ── Rule 1: bank statement check (skipped if we know it's an invoice) ────
+    if not is_invoice:
+        strong = sum(1 for kw in BANK_STRONG_KEYWORDS if kw in t)
+        weak   = sum(1 for kw in BANK_WEAK_KEYWORDS   if kw in t)
+        if strong >= 1 or weak >= 3:
+            return "bank_statement"
+
+    # ── Rule 2: perspective-aware invoice classification ─────────────────────
     cost_score   = sum(1 for kw in COST_KEYWORDS   if kw in t)
     income_score = sum(1 for kw in INCOME_KEYWORDS if kw in t)
-
-    if bank_score >= 2 or bank_score > max(cost_score, income_score):
-        return "bank_statement"
 
     if OWN_COMPANY_NAME:
         own = OWN_COMPANY_NAME.lower()
@@ -141,12 +164,11 @@ def classify_page(text: str) -> str:
             if (first_sayin == -1 or own_pos < first_sayin) and cost_score > 0:
                 return "income"
 
+    # ── Rule 3: keyword score fallback ───────────────────────────────────────
     if cost_score == 0 and income_score == 0:
         return "unknown"
     if income_score > cost_score:
         return "income"
-    if cost_score > income_score:
-        return "cost"
     return "cost"
 
 
@@ -530,10 +552,10 @@ def process_pdf(pdf_path: str) -> None:
                     pending.append(info)
                 continue
 
-            info["doc_type"]  = classify_page(text)
+            info["fatura_no"] = extract_fatura_no(text)   # extract first
+            info["doc_type"]  = classify_page(text, fatura_no=info["fatura_no"])
             info["date_obj"], _ = extract_date(text)
             info["company"]   = extract_company(text)
-            info["fatura_no"] = extract_fatura_no(text)
             info["tutar"]     = extract_tutar(text)
             info["iban"]      = extract_iban(text)
             info["status"]    = "success"
