@@ -8,8 +8,8 @@ results/
 __pycache__/
 *.py[cod]
 
-# EasyOCR model cache
-.EasyOCR/
+# Secrets
+.env
 
 # OS junk
 .DS_Store

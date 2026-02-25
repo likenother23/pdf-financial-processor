@@ -1,8 +1,5 @@
-pymupdf
-pdfplumber
+anthropic
+python-dotenv
 pypdf
-easyocr
-Pillow
 pandas
-numpy
 openpyxl
