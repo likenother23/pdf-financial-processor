@@ -49,6 +49,19 @@ OCR_SCALE = 2.0
 
 RE_SAYIN = re.compile(r"say[iı1l][nm]", re.IGNORECASE)
 
+# Detect Tesseract availability once at startup
+def _tesseract_available() -> bool:
+    try:
+        import pytesseract
+        pytesseract.get_tesseract_version()
+        return True
+    except Exception:
+        return False
+
+TESSERACT_OK = _tesseract_available()
+if not TESSERACT_OK:
+    print("[WARN] Tesseract not found — Sayın OCR override disabled, trusting Claude only.")
+
 
 # ── constants ──────────────────────────────────────────────────────────────────
 
@@ -253,7 +266,7 @@ def ocr_sayin_override(pdf_path: str, page_idx: int, result: dict) -> dict:
     Finds the 'Sayın' line and checks the next 5 lines for 'nove' (Novesyst).
     Skips continuation pages (they have no Sayın by definition).
     """
-    if result.get("is_continuation"):
+    if result.get("is_continuation") or not TESSERACT_OK:
         return result
 
     try:
