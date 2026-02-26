@@ -3,3 +3,7 @@ python-dotenv
 pypdf
 pandas
 openpyxl
+pdfplumber
+pypdfium2
+pytesseract
+Pillow

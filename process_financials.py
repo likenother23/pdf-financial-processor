@@ -31,6 +31,9 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 import shutil
 import anthropic
+import pypdfium2 as pdfium
+import pytesseract
+from PIL import Image
 from pypdf import PdfReader, PdfWriter
 import pandas as pd
 
@@ -40,6 +43,11 @@ import pandas as pd
 OWN_COMPANY_NAME = "NOVESYST"
 CLAUDE_MODEL     = "claude-haiku-4-5-20251001"
 MAX_TOKENS       = 512
+
+# OCR render scale for Sayın override check
+OCR_SCALE = 2.0
+
+RE_SAYIN = re.compile(r"say[iı1l][nm]", re.IGNORECASE)
 
 
 # ── constants ──────────────────────────────────────────────────────────────────
@@ -78,44 +86,69 @@ Given a page from a Turkish financial PDF, return ONLY a JSON object with these 
   "is_continuation": true | false
 }}
 
-══ MOST IMPORTANT RULE ══
-If the page contains ANY invoice/fatura number (a document reference like EFA2026000000001,
-BYS2026000000378, MTO2026000000002, or any code matching 2-5 letters + 4-digit year + digits),
-then doc_type MUST be "cost" or "income" — NEVER "bank_statement".
-Invoices always contain payment IBANs and bank names, but that does NOT make them bank statements.
+══ STEP 1 — Is this page a bill, a continuation, or a bank statement? ══
 
-══ doc_type rules ══
-"cost"           → invoice/bill where {OWN_COMPANY_NAME} is the BUYER
-                   (alıcı / müşteri / faturayı alan / sayın {OWN_COMPANY_NAME})
-"income"         → invoice/bill where {OWN_COMPANY_NAME} is the SELLER
-                   (satıcı / tedarikçi / faturayı kesen / düzenleyen {OWN_COMPANY_NAME})
-"bank_statement" → ONLY for genuine bank account statements: hesap özeti, ekstre,
-                   hesap hareketi listesi. These have NO fatura_no and show debit/credit rows.
-"unknown"        → cannot determine
+A page is a BILL FIRST PAGE if ANY of the following are true:
+  • It contains a fatura/invoice number (Fatura No field)
+  • It contains the e-FATURA or e-Arşiv Fatura stamp/header
+  → doc_type MUST be "cost" or "income". NEVER "bank_statement".
+
+A page is a CONTINUATION (is_continuation: true) if:
+  • No fatura_no on this page
+  • No e-FATURA / e-Arşiv stamp
+  • No "Sayın" field
+  • Page contains ONLY items, totals, or payment info (e.g. "BANKA HESAP BİLGİLERİ" with IBANs)
+  → is_continuation: true, doc_type: same as previous page (cost/income)
+
+  !! IMPORTANT: A page showing "BANKA HESAP BİLGİLERİ" with IBAN numbers is the PAYMENT
+  SECTION of an invoice (page 2/2), NOT a bank statement. Mark it as is_continuation: true.
+
+A page is a BANK STATEMENT only if ALL are true:
+  • No fatura_no, no e-FATURA stamp, no "Sayın" field
+  • Has a heading like "Hesap Ekstresi" / "Hesap Özeti" / "Banka Ekstresi"
+  • Shows transaction rows with columns: tarih / açıklama / borç / alacak / bakiye
+
+══ STEP 2 — For bill first pages: cost or income? ══
+CRITICAL: Both {OWN_COMPANY_NAME} and the other company ALWAYS appear on EVERY bill.
+Do NOT use position, visual prominence, or "Fatura Tipi" to classify.
+
+!! "Fatura Tipi: SATIS" appears on ALL invoices (both cost and income). IGNORE this field.
+
+Use ONLY the "Sayın" field — it identifies the BUYER (who pays):
+  • "Sayın {OWN_COMPANY_NAME}" → doc_type: "cost"
+    The other company is at the top as seller. {OWN_COMPANY_NAME} is below as buyer. This is cost.
+  • "Sayın [other company]" → doc_type: "income"
+    {OWN_COMPANY_NAME} is at the top as seller. The other company is below as buyer.
+
+If "Sayın {OWN_COMPANY_NAME}" appears ANYWHERE on the page → doc_type: "cost". No exceptions.
 
 ══ fatura_no ══
 The invoice document number (e.g. EFA2026000000001, BYS2026000000378).
 Turkish e-fatura format: 2-5 uppercase letters + 4-digit year + 9 digits (total 13-18 chars).
-Return null only if truly absent from this page.
+Every valid bill ALWAYS has a fatura_no on its first page — search carefully before returning null.
 
 ══ date ══
-The document ISSUE date: look for "fatura tarihi", "düzenleme tarihi", "belge tarihi", "tarih".
+The document ISSUE date. Look for: "fatura tarihi", "düzenleme tarihi", "belge tarihi", "tarih".
 Format as DD.MM.YYYY.
 NEVER use vade tarihi, son ödeme tarihi, or any due/payment deadline date.
-Search carefully — the date may appear in a header, stamp, or table cell.
-Return null only if no issue date exists anywhere on the page.
+Every valid bill ALWAYS has an issue date — search carefully (header, stamp, table cell) before returning null.
 
 ══ company ══
 The name of the OTHER company (not {OWN_COMPANY_NAME}).
-Return null if not found or if this is a continuation page.
+Both companies appear on every bill — return only the one that is NOT {OWN_COMPANY_NAME}.
+Return null only on continuation pages where no company name appears.
 
 ══ tutar ══
 Final total amount payable: ödenecek tutar / genel toplam / toplam tutar (KDV dahil).
 Format exactly as printed e.g. "1.234,56". Return null if not found.
 
 ══ is_continuation ══
-true  → page 2+ of a multi-page document (no own header/fatura_no, just item rows or extra pages).
-false → first or only page of a new document.
+true  → continuation page of a multi-page document:
+        - no fatura_no on this page
+        - no e-FATURA stamp
+        - no "Sayın" field
+        - contains only item rows, subtotals, or supplementary pages
+false → first (or only) page of a new document.
 
 Return ONLY the JSON object. No markdown fences, no explanation.\
 """
@@ -178,7 +211,7 @@ def classify_page_claude(page_pdf_bytes: bytes) -> dict:
 
     return {
         "doc_type":        str(result.get("doc_type") or "unknown"),
-        "fatura_no":       str(result.get("fatura_no") or "").strip(),
+        "fatura_no":       str(result.get("fatura_no") or "").strip().upper(),
         "date_str":        str(result.get("date") or "").strip(),
         "company":         str(result.get("company") or "").strip(),
         "tutar":           str(result.get("tutar") or "").strip(),
@@ -191,6 +224,60 @@ def _empty_result() -> dict:
         "doc_type": "unknown", "fatura_no": "", "date_str": "",
         "company": "", "tutar": "", "is_continuation": False,
     }
+
+
+NOVESYST_SIGNALS = ["nove", "vesyst", "6321463"]  # covers OCR errors like sovesyst, n0vesyst
+
+def _sayin_buyer(text: str) -> str:
+    """
+    Find who appears after 'Sayın' in OCR text.
+    Returns 'novesyst', 'other', or 'unknown'.
+    Looks at the 10 lines after each Sayın occurrence.
+    Uses multiple signals to handle OCR errors (sovesyst, n0vesyst, etc.)
+    Also checks Novesyst's unique VKN (6321463957) as a fallback.
+    """
+    lines = [l.strip() for l in text.splitlines()]
+    for i, line in enumerate(lines):
+        if RE_SAYIN.search(line):
+            context = " ".join(lines[i + 1: i + 11]).lower()
+            if any(sig in context for sig in NOVESYST_SIGNALS):
+                return "novesyst"
+            elif len(context.strip()) > 3:
+                return "other"
+    return "unknown"
+
+
+def ocr_sayin_override(pdf_path: str, page_idx: int, result: dict) -> dict:
+    """
+    After Claude classifies a page, verify cost/income using OCR + Sayın rule.
+    Finds the 'Sayın' line and checks the next 5 lines for 'nove' (Novesyst).
+    Skips continuation pages (they have no Sayın by definition).
+    """
+    if result.get("is_continuation"):
+        return result
+
+    try:
+        doc    = pdfium.PdfDocument(pdf_path)
+        page   = doc[page_idx]
+        bitmap = page.render(scale=OCR_SCALE)
+        text   = pytesseract.image_to_string(bitmap.to_pil(), lang="tur+eng")
+
+        buyer = _sayin_buyer(text)
+
+        if buyer == "novesyst":
+            if result["doc_type"] != "cost":
+                print(f"    [SAYIN OVERRIDE] {result['doc_type']} → cost")
+            result["doc_type"] = "cost"
+        elif buyer == "other":
+            if result["doc_type"] != "income":
+                print(f"    [SAYIN OVERRIDE] {result['doc_type']} → income")
+            result["doc_type"] = "income"
+        # buyer == 'unknown' → no Sayın found → trust Claude
+
+    except Exception as e:
+        print(f"    [SAYIN OVERRIDE] OCR failed: {e}", file=sys.stderr)
+
+    return result
 
 
 def parse_date(date_str: str):
@@ -244,7 +331,12 @@ def save_pages_as_pdf(src_reader: PdfReader, page_indices: list[int], dest_path:
 
 # ── main processing loop ────────────────────────────────────────────────────────
 
-def process_pdf(pdf_path: str) -> None:
+def process_pdf(pdf_path: str, start_page: int = 1, end_page: int = None) -> None:
+    """
+    Process a PDF file.
+    start_page / end_page are 1-indexed and inclusive.
+    If end_page is None, processes until the last page.
+    """
     pdf_path = os.path.abspath(pdf_path)
     if not os.path.isfile(pdf_path):
         print(f"[ERROR] File not found: {pdf_path}")
@@ -260,9 +352,14 @@ def process_pdf(pdf_path: str) -> None:
     reader      = PdfReader(pdf_path)
     total_pages = len(reader.pages)
 
+    # Clamp and convert to 0-based indices
+    start_idx = max(0, start_page - 1)
+    end_idx   = min(total_pages - 1, (end_page - 1) if end_page else total_pages - 1)
+    page_range = range(start_idx, end_idx + 1)
+
     print(f"\n{'='*60}")
     print(f"  Processing : {Path(pdf_path).name}")
-    print(f"  Pages      : {total_pages}")
+    print(f"  Pages      : {start_page}–{end_idx + 1} of {total_pages}")
     print(f"  Model      : {CLAUDE_MODEL}")
     print(f"  Output     : {base_out}")
     print(f"{'='*60}\n")
@@ -335,7 +432,7 @@ def process_pdf(pdf_path: str) -> None:
 
     # ── page loop ───────────────────────────────────────────────────────────────
 
-    for page_idx in range(total_pages):
+    for page_idx in page_range:
         page_num = page_idx + 1
         info = {
             "index":           page_idx,
@@ -353,6 +450,9 @@ def process_pdf(pdf_path: str) -> None:
             page_bytes = page_to_pdf_bytes(reader, page_idx)
             result     = classify_page_claude(page_bytes)
 
+            # OCR-based Sayın override — ground truth for cost/income
+            result = ocr_sayin_override(pdf_path, page_idx, result)
+
             info["doc_type"]        = result["doc_type"]
             info["fatura_no"]       = result["fatura_no"]
             info["date_obj"]        = parse_date(result["date_str"])
@@ -364,7 +464,7 @@ def process_pdf(pdf_path: str) -> None:
             # Hard override: a page with a fatura_no is ALWAYS an invoice.
             # Claude can misread IBAN/banka keywords as a bank statement.
             if info["fatura_no"] and info["doc_type"] == "bank_statement":
-                info["doc_type"] = "cost"  # safest fallback; prompt already asked for perspective
+                info["doc_type"] = "cost"
                 print(f"    [OVERRIDE] fatura_no present → changed bank_statement → cost")
 
             cont_tag = " <CONT>" if result["is_continuation"] else ""
@@ -436,7 +536,7 @@ def process_pdf(pdf_path: str) -> None:
     )
 
     print(f"\n{'='*60}")
-    print(f"  Done!  {success}/{total_pages} pages | {doc_count} documents saved")
+    print(f"  Done!  {success}/{len(page_range)} pages | {doc_count} documents saved")
     print(f"  Cost:         {counts.get('cost', 0)}")
     print(f"  Income:       {counts.get('income', 0)}")
     print(f"  Bank stmts:   {counts.get('bank_statement', 0)}")
@@ -454,7 +554,9 @@ if __name__ == "__main__":
         print("PDF Financial Document Processor")
         print("-" * 40)
         path = input("Enter the full path to the PDF file: ").strip().strip('"')
+        process_pdf(path)
     else:
-        path = sys.argv[1].strip('"')
-
-    process_pdf(path)
+        path  = sys.argv[1].strip('"')
+        start = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+        end   = int(sys.argv[3]) if len(sys.argv) > 3 else None
+        process_pdf(path, start_page=start, end_page=end)
