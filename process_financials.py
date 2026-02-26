@@ -31,6 +31,7 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 import shutil
 import anthropic
+import pdfplumber
 import pypdfium2 as pdfium
 import pytesseract
 from PIL import Image
@@ -60,7 +61,48 @@ def _tesseract_available() -> bool:
 
 TESSERACT_OK = _tesseract_available()
 if not TESSERACT_OK:
-    print("[WARN] Tesseract not found — Sayın OCR override disabled, trusting Claude only.")
+    print("[WARN] Tesseract not found — Sayın OCR override disabled, using pdfplumber instead.")
+
+# Regex for "Sayın" buyer detection (covers OCR/encoding variants)
+_RE_SAYIN     = re.compile(r"say[iı1l][nm][:\s]+(.{2,80})", re.IGNORECASE)
+_RE_OWN       = re.compile(r"n[o0]vesyst", re.IGNORECASE)
+# NOVESYST's VKN as a fallback signal
+_OWN_VKN      = "6321463957"
+
+
+def sayin_perspective(pdf_path: str, page_idx: int) -> str:
+    """
+    Use pdfplumber text extraction to find 'Sayın' and decide cost vs income.
+    Returns 'cost', 'income', or '' (no signal found — trust Claude).
+    Works on digital PDFs without Tesseract.
+    """
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            text = pdf.pages[page_idx].extract_text() or ""
+        if len(text.strip()) < 30:
+            return ""   # too little text — scanned page, can't determine
+
+        # Check every Sayın occurrence
+        for m in _RE_SAYIN.finditer(text):
+            buyer_line = m.group(1).split("\n")[0].strip()
+            if _RE_OWN.search(buyer_line) or _OWN_VKN in buyer_line:
+                return "cost"
+            if len(buyer_line) > 3:
+                return "income"
+
+        # Fallback: VKN position check (ALICI vs SATICI section)
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            if _OWN_VKN in line:
+                # Look backwards for the nearest section header
+                context = " ".join(lines[max(0, i-5):i]).lower()
+                if "alici" in context or "alıcı" in context or "müşteri" in context:
+                    return "cost"
+                if "satici" in context or "satıcı" in context or "tedarik" in context:
+                    return "income"
+    except Exception:
+        pass
+    return ""   # no signal — trust Claude
 
 
 # ── constants ──────────────────────────────────────────────────────────────────
@@ -86,82 +128,49 @@ def get_client() -> anthropic.Anthropic:
 # ── system prompt ───────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = f"""\
-You are a financial document classifier for a Turkish company called {OWN_COMPANY_NAME}.
-
-Given a page from a Turkish financial PDF, return ONLY a JSON object with these exact fields:
+You are extracting data from a Turkish financial PDF page. Return ONLY a JSON object.
 
 {{
-  "doc_type": "cost" | "income" | "bank_statement" | "unknown",
+  "page_type": "bill" | "bank_statement" | "continuation" | "unknown",
+  "alici": string | null,
+  "satici": string | null,
   "fatura_no": string | null,
   "date": "DD.MM.YYYY" | null,
-  "company": string | null,
-  "tutar": string | null,
-  "is_continuation": true | false
+  "tutar": string | null
 }}
 
-══ STEP 1 — Is this page a bill, a continuation, or a bank statement? ══
+══ page_type ══
+"bill"         → has a fatura/invoice number OR e-FATURA / e-Arşiv stamp
+"bank_statement" → genuine bank account statement (Hesap Ekstresi/Özeti) with debit/credit rows.
+                   NOT a bill. Has NO fatura_no. Shows transaction history.
+"continuation" → page 2+ of a multi-page document. No fatura_no, no document header.
+                 Only item rows, subtotals, or a payment/IBAN section continuing from the previous page.
+                 A page with BANKA HESAP BİLGİLERİ / IBAN info but no fatura_no is a CONTINUATION.
+"unknown"      → cannot determine
 
-A page is a BILL FIRST PAGE if ANY of the following are true:
-  • It contains a fatura/invoice number (Fatura No field)
-  • It contains the e-FATURA or e-Arşiv Fatura stamp/header
-  → doc_type MUST be "cost" or "income". NEVER "bank_statement".
+══ alici ══
+The full name of the ALICI (buyer / recipient) on this invoice.
+This is the company that PAYS. Read it from the ALICI, Alıcı, Müşteri, or Sayın field.
+Return null if this is not a bill or if not visible.
 
-A page is a CONTINUATION (is_continuation: true) if:
-  • No fatura_no on this page
-  • No e-FATURA / e-Arşiv stamp
-  • No "Sayın" field
-  • Page contains ONLY items, totals, or payment info (e.g. "BANKA HESAP BİLGİLERİ" with IBANs)
-  → is_continuation: true, doc_type: same as previous page (cost/income)
-
-  !! IMPORTANT: A page showing "BANKA HESAP BİLGİLERİ" with IBAN numbers is the PAYMENT
-  SECTION of an invoice (page 2/2), NOT a bank statement. Mark it as is_continuation: true.
-
-A page is a BANK STATEMENT only if ALL are true:
-  • No fatura_no, no e-FATURA stamp, no "Sayın" field
-  • Has a heading like "Hesap Ekstresi" / "Hesap Özeti" / "Banka Ekstresi"
-  • Shows transaction rows with columns: tarih / açıklama / borç / alacak / bakiye
-
-══ STEP 2 — For bill first pages: cost or income? ══
-CRITICAL: Both {OWN_COMPANY_NAME} and the other company ALWAYS appear on EVERY bill.
-Do NOT use position, visual prominence, or "Fatura Tipi" to classify.
-
-!! "Fatura Tipi: SATIS" appears on ALL invoices (both cost and income). IGNORE this field.
-
-Use ONLY the "Sayın" field — it identifies the BUYER (who pays):
-  • "Sayın {OWN_COMPANY_NAME}" → doc_type: "cost"
-    The other company is at the top as seller. {OWN_COMPANY_NAME} is below as buyer. This is cost.
-  • "Sayın [other company]" → doc_type: "income"
-    {OWN_COMPANY_NAME} is at the top as seller. The other company is below as buyer.
-
-If "Sayın {OWN_COMPANY_NAME}" appears ANYWHERE on the page → doc_type: "cost". No exceptions.
+══ satici ══
+The full name of the SATICI (seller / issuer) on this invoice.
+This is the company that RECEIVES payment. Read it from the SATICI, Satıcı, or Tedarikçi field.
+Return null if this is not a bill or if not visible.
 
 ══ fatura_no ══
-The invoice document number (e.g. EFA2026000000001, BYS2026000000378).
-Turkish e-fatura format: 2-5 uppercase letters + 4-digit year + 9 digits (total 13-18 chars).
-Every valid bill ALWAYS has a fatura_no on its first page — search carefully before returning null.
+The invoice number (e.g. EFA2026000000001, BYS2026000000378).
+Turkish e-fatura: 2-5 uppercase letters + 4-digit year + digits. Search carefully.
+Return null if not present.
 
 ══ date ══
-The document ISSUE date. Look for: "fatura tarihi", "düzenleme tarihi", "belge tarihi", "tarih".
-Format as DD.MM.YYYY.
-NEVER use vade tarihi, son ödeme tarihi, or any due/payment deadline date.
-Every valid bill ALWAYS has an issue date — search carefully (header, stamp, table cell) before returning null.
-
-══ company ══
-The name of the OTHER company (not {OWN_COMPANY_NAME}).
-Both companies appear on every bill — return only the one that is NOT {OWN_COMPANY_NAME}.
-Return null only on continuation pages where no company name appears.
+The document ISSUE date from "fatura tarihi" / "düzenleme tarihi" / "tarih" field.
+Format: DD.MM.YYYY. NEVER use vade tarihi or son ödeme tarihi.
+Return null if not found.
 
 ══ tutar ══
-Final total amount payable: ödenecek tutar / genel toplam / toplam tutar (KDV dahil).
-Format exactly as printed e.g. "1.234,56". Return null if not found.
-
-══ is_continuation ══
-true  → continuation page of a multi-page document:
-        - no fatura_no on this page
-        - no e-FATURA stamp
-        - no "Sayın" field
-        - contains only item rows, subtotals, or supplementary pages
-false → first (or only) page of a new document.
+Final total payable: ödenecek tutar / genel toplam (KDV dahil). e.g. "1.234,56".
+Return null if not found.
 
 Return ONLY the JSON object. No markdown fences, no explanation.\
 """
@@ -222,13 +231,40 @@ def classify_page_claude(page_pdf_bytes: bytes) -> dict:
         print(f"    [WARN] JSON parse failed ({exc}) — raw: {raw[:120]}", file=sys.stderr)
         return _empty_result()
 
+    alici  = str(result.get("alici")  or "").strip()
+    satici = str(result.get("satici") or "").strip()
+
+    # Determine doc_type from alici/satici in Python — more reliable than asking Claude to judge
+    page_type = str(result.get("page_type") or "unknown")
+    if page_type == "bank_statement":
+        doc_type = "bank_statement"
+    elif page_type == "continuation":
+        doc_type = "unknown"   # will be resolved by grouping logic
+    elif page_type in ("bill", "unknown"):
+        if _RE_OWN.search(alici) or _OWN_VKN in alici:
+            doc_type = "cost"
+        elif _RE_OWN.search(satici) or _OWN_VKN in satici:
+            doc_type = "income"
+        else:
+            doc_type = "cost"  # default — most invoices a company handles are bills it receives
+    else:
+        doc_type = "unknown"
+
+    # The "other" company is whichever of alici/satici is not NOVESYST
+    if doc_type == "cost":
+        company = satici  # seller is the other party on a cost invoice
+    elif doc_type == "income":
+        company = alici   # buyer is the other party on an income invoice
+    else:
+        company = alici or satici
+
     return {
-        "doc_type":        str(result.get("doc_type") or "unknown"),
+        "doc_type":        doc_type,
         "fatura_no":       str(result.get("fatura_no") or "").strip().upper(),
         "date_str":        str(result.get("date") or "").strip(),
-        "company":         str(result.get("company") or "").strip(),
+        "company":         company,
         "tutar":           str(result.get("tutar") or "").strip(),
-        "is_continuation": bool(result.get("is_continuation", False)),
+        "is_continuation": page_type == "continuation",
     }
 
 
@@ -463,8 +499,18 @@ def process_pdf(pdf_path: str, start_page: int = 1, end_page: int = None) -> Non
             page_bytes = page_to_pdf_bytes(reader, page_idx)
             result     = classify_page_claude(page_bytes)
 
-            # OCR-based Sayın override — ground truth for cost/income
-            result = ocr_sayin_override(pdf_path, page_idx, result)
+            # Sayın override — ground truth for cost/income.
+            # Try pdfplumber first (fast, no Tesseract needed for digital PDFs).
+            # Fall back to Tesseract OCR if pdfplumber gives too little text.
+            if not result.get("is_continuation"):
+                perspective = sayin_perspective(pdf_path, page_idx)
+                if perspective:
+                    if perspective != result["doc_type"] and result["doc_type"] in ("cost", "income"):
+                        print(f"    [SAYIN] {result['doc_type']} → {perspective}")
+                    result["doc_type"] = perspective
+                else:
+                    # pdfplumber found no signal → try Tesseract if available
+                    result = ocr_sayin_override(pdf_path, page_idx, result)
 
             info["doc_type"]        = result["doc_type"]
             info["fatura_no"]       = result["fatura_no"]
