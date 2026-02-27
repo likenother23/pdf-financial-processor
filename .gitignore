@@ -1,5 +1,6 @@
 # Output — never commit processed PDFs or logs
 results/
+results_2/
 results_local/
 
 # Source PDFs — too large to track in git
